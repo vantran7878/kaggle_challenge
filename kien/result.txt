@@ -1,3 +1,5 @@
+
+train_dual_if_asymmetric
 =============================================
   BEST THRESHOLD: 0.81
   MAX F1-SCORE:   67.29%
@@ -13,4 +15,5 @@
    macro avg       0.67      0.67      0.67      1000
 weighted avg       0.77      0.77      0.77      1000
 
-Dự đoán tập test full:  62.92% - 63%
+Dự đoán tập test full:  62.92% - 63% (có data leakage trên tập test_sample)
+chưa xét đến chỉ số ROC
