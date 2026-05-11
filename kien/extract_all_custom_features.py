@@ -4,6 +4,7 @@ import math
 import ast
 import numpy as np
 import pandas as pd
+from collections import Counter
 from tqdm.auto import tqdm
 
 try:
@@ -33,6 +34,166 @@ MAGIKA_LABEL_MAP = {
     'ruby':       'Python',
     'perl':       'Python',
 }
+
+# Keywords đa ngôn ngữ dùng để lọc identifier (giống preprocess_features.py)
+MULTI_LANG_KEYWORDS = {
+    'if', 'else', 'for', 'while', 'do', 'switch', 'case', 'break', 'continue', 'return',
+    'int', 'float', 'double', 'char', 'void', 'bool', 'boolean', 'string', 'var', 'let', 'const',
+    'def', 'function', 'class', 'struct', 'interface', 'package', 'import', 'using', 'namespace',
+    'public', 'private', 'protected', 'static', 'final', 'const', 'try', 'catch', 'finally',
+    'throw', 'throws', 'new', 'delete', 'true', 'false', 'null', 'nil', 'None', 'self', 'this',
+    'func', 'defer', 'go', 'map', 'chan', 'type', 'range'
+}
+
+# Compiled regex dùng chung cho các agnostic features
+_RE_WORDS      = re.compile(r'\w+')
+_RE_CAMEL      = re.compile(r'[a-z][A-Z]')
+_RE_DIGITS     = re.compile(r'\d')
+_RE_EQ_SPACED  = re.compile(r' = ')
+_RE_EQ_NOSPACE = re.compile(r'(?<=[^\s])=(?=[^\s])')
+
+# ============================================================
+# AGNOSTIC FEATURES (ag_1 → ag_10) — ported from preprocess_features.py
+# ============================================================
+
+def _analyze_identifiers(words: list) -> dict:
+    """
+    ag_1: id_len_avg      — Độ dài trung bình của identifier
+    ag_2: id_entropy      — Entropy ký tự của tất cả identifier
+    ag_3: id_short_ratio  — Tỉ lệ identifier ngắn (≤2 ký tự, vd: i, j, x)
+    ag_4: id_num_ratio    — Tỉ lệ identifier chứa chữ số (vd: var1, temp2)
+    """
+    identifiers = [w for w in words if w not in MULTI_LANG_KEYWORDS and not w.isdigit()]
+
+    if not identifiers:
+        return {
+            'id_len_avg':     0.0,
+            'id_entropy':     0.0,
+            'id_short_ratio': 0.0,
+            'id_num_ratio':   0.0,
+        }
+
+    # ag_1 — Độ dài trung bình
+    lens = [len(w) for w in identifiers]
+    avg_len = float(np.mean(lens))
+
+    # ag_2 — Entropy ký tự
+    all_chars = "".join(identifiers)
+    if not all_chars:
+        entropy = 0.0
+    else:
+        char_counts = Counter(all_chars)
+        total_chars = sum(char_counts.values())
+        entropy = -sum(
+            (c / total_chars) * math.log2(c / total_chars)
+            for c in char_counts.values()
+        )
+
+    # ag_3 — Tỉ lệ identifier ngắn (≤2 ký tự)
+    short_ratio = sum(1 for w in identifiers if len(w) <= 2) / len(identifiers)
+
+    # ag_4 — Tỉ lệ identifier có chữ số
+    num_ratio = sum(1 for w in identifiers if _RE_DIGITS.search(w)) / len(identifiers)
+
+    return {
+        'id_len_avg':     round(avg_len,     6),
+        'id_entropy':     round(entropy,     6),
+        'id_short_ratio': round(short_ratio, 6),
+        'id_num_ratio':   round(num_ratio,   6),
+    }
+
+
+def _analyze_consistency(code: str, words: list) -> dict:
+    """
+    ag_5: style_consistency — Mức độ nhất quán giữa camelCase và snake_case
+                              (1.0 = chỉ dùng 1 kiểu, 0.0 = trộn đều)
+    ag_6: spacing_ratio     — Tỉ lệ dấu '=' không có khoảng trắng xung quanh
+                              (LLM hay dùng ' = ', human hay bỏ sót khoảng trắng)
+    """
+    identifiers = [w for w in words if w not in MULTI_LANG_KEYWORDS]
+
+    # ag_5 — Camel vs Snake consistency
+    snake_count = sum(1 for w in identifiers if '_' in w)
+    camel_count = sum(1 for w in identifiers if _RE_CAMEL.search(w))
+    total_style = snake_count + camel_count
+
+    if total_style == 0:
+        consistency = 0.0
+    else:
+        consistency = abs(snake_count - camel_count) / total_style
+
+    # ag_6 — Spacing quanh '='
+    spaced   = len(_RE_EQ_SPACED.findall(code))
+    nospaced = len(_RE_EQ_NOSPACE.findall(code))
+    total_eq = spaced + nospaced
+
+    spacing_ratio = (nospaced / total_eq) if total_eq > 0 else 0.0
+
+    return {
+        'style_consistency': round(consistency,   6),
+        'spacing_ratio':     round(spacing_ratio, 6),
+    }
+
+
+def _analyze_structure(code: str, words: list) -> dict:
+    """
+    ag_7:  line_len_std  — Độ lệch chuẩn độ dài dòng (human → cao hơn)
+    ag_8:  ttr           — Type-Token Ratio (đo sự lặp từ vựng)
+    ag_9:  comment_ratio — Tỉ lệ dòng là comment
+    ag_10: human_markers — Có TODO/FIXME/DEBUG/HACK hay không (0/1)
+    """
+    lines = code.split('\n')
+    non_empty = [l for l in lines if l.strip()]
+
+    # ag_7 — Std độ dài dòng
+    if non_empty:
+        line_lens = [len(l) for l in non_empty]
+        line_std = float(np.std(line_lens))
+    else:
+        line_std = 0.0
+
+    # ag_8 — TTR
+    ttr = (len(set(words)) / len(words)) if words else 0.0
+
+    # ag_9 — Comment ratio
+    comment_lines = sum(
+        1 for l in non_empty
+        if l.strip().startswith(('#', '//', '/*'))
+    )
+    comment_ratio = comment_lines / (len(non_empty) + 1)
+
+    # ag_10 — Human markers
+    markers = len(re.findall(r'\b(TODO|FIXME|XXX|HACK|DEBUG)\b', code, re.IGNORECASE))
+    human_markers = 1.0 if markers > 0 else 0.0
+
+    return {
+        'line_len_std':  round(line_std,      6),
+        'ttr':           round(ttr,           6),
+        'comment_ratio': round(comment_ratio, 6),
+        'human_markers': human_markers,
+    }
+
+
+def extract_agnostic_features(code: str) -> dict:
+    """
+    Entry point cho 10 agnostic features (ag_1 → ag_10).
+    Không cần model neural — chỉ dùng regex + thống kê.
+    """
+    if not isinstance(code, str):
+        code = str(code)
+
+    words = _RE_WORDS.findall(code)
+
+    result = {}
+    result.update(_analyze_identifiers(words))
+    result.update(_analyze_consistency(code, words))
+    result.update(_analyze_structure(code, words))
+    return result
+
+
+# ============================================================
+# CÁC FEATURE GỐC (giữ nguyên)
+# ============================================================
 
 def get_llm_greeting_value(code: str) -> int:
     if not isinstance(code, str) or not code.strip():
@@ -158,15 +319,30 @@ def extract_artifact_features(code_string: str) -> dict:
         'placeholder_ratio': round(placeholder_ratio, 6)
     }
 
+# ============================================================
+# ENTRY POINT TỔNG HỢP
+# ============================================================
+
 def extract_all_custom_features(code: str) -> dict:
+    """
+    Trích xuất toàn bộ feature từ một đoạn code:
+      - 4 features gốc (llm_greeting, token_count, maintainability_index, internal_fan_out)
+      - 2 features hàm (function_length_cv, function_count)
+      - 2 features artifact (debug_artifact_score, placeholder_ratio)
+      - 10 agnostic features (ag_1→ag_10):
+            id_len_avg, id_entropy, id_short_ratio, id_num_ratio,
+            style_consistency, spacing_ratio,
+            line_len_std, ttr, comment_ratio, human_markers
+    """
     res = {
-        'llm_greeting': get_llm_greeting_value(code),
-        'token_count': extract_token_count(code),
+        'llm_greeting':          get_llm_greeting_value(code),
+        'token_count':           extract_token_count(code),
         'maintainability_index': extract_maintainability_index(code),
-        'internal_fan_out': extract_internal_fan_out(code),
+        'internal_fan_out':      extract_internal_fan_out(code),
     }
     res.update(extract_function_features(code))
     res.update(extract_artifact_features(code))
+    res.update(extract_agnostic_features(code))   # ag_1 → ag_10
     return res
 
 # ============================================================
@@ -204,7 +380,7 @@ def add_features_to_dataframe(df: pd.DataFrame, code_col='code', detect_lang=Fal
         except NameError:
             print("[!] Có lỗi: Chưa cài đặt thư viện magika. Vui lòng chạy 'pip install magika'. Bỏ qua quá trình detect language.")
 
-    print("[*] Bắt đầu trích xuất tuần tự (khoảng 8 features từ code)...")
+    print("[*] Bắt đầu trích xuất tuần tự (18 features từ code)...")
     extracted = df[code_col].progress_apply(extract_all_custom_features).apply(pd.Series)
     
     # Gộp vào DataFrame xoá trùng nếu có
